@@ -120,6 +120,7 @@ class RadarViewModel(application: Application) : AndroidViewModel(application) {
     // ── Public API ─────────────────────────────────────────────────────────────
 
     fun startSession() {
+        if (_sessionActive.value) return   // prevent double-start on recomposition
         bleManager.startAdvertising()
         bleManager.startScanning()
         orientationManager.start()
@@ -133,11 +134,20 @@ class RadarViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun pauseSession() {
+        // Guard: onPause() fires before startSession() on first launch and
+        // during the permission-grant flow.  Without this check, setScanMode()
+        // would start (then double-start) scanning before the session exists,
+        // triggering SCAN_FAILED_ALREADY_STARTED on Samsung devices — which
+        // silently kills the scan and leaves the device unable to see peers.
+        if (!_sessionActive.value) return
         bleManager.setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
         orientationManager.stop()
     }
 
     fun resumeSession() {
+        // Guard: onResume() fires before startSession() on first launch and
+        // after the permission dialog closes.  Same double-start issue as above.
+        if (!_sessionActive.value) return
         bleManager.setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
         orientationManager.start()
     }
