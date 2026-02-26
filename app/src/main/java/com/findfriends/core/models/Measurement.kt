@@ -1,21 +1,18 @@
 package com.findfriends.core.models
 
 /**
- * Represents a single distance reading between THIS device and ONE peer.
+ * A single distance reading between THIS device and ONE peer.
  *
- * This is the core unit of data produced by BleManager and consumed by
- * both the radar UI (local) and SyncManager (server upload).
+ * Core data unit: produced by BleManager, consumed by SyncManager (server upload).
  *
- * @param pairKey       Canonical sorted key e.g. "AABBCCDD::EEFF0011"
- *                      Always the same regardless of who is reporting.
- * @param reporterId    The device ID of the phone that made this measurement.
- * @param peerId        The device ID of the phone that was detected.
- * @param distanceMeters Estimated distance in metres from RSSI via FSPL formula.
- * @param rawRssi       The raw RSSI value straight from the BLE scan result.
- * @param smoothedRssi  RSSI after Kalman filtering — what distanceMeters is based on.
- * @param confidence    0.0–1.0 score. Drops when rawRssi deviates far from smoothedRssi,
- *                      meaning the signal is noisy (obstacles, multipath reflection).
- * @param timestamp     Unix millis when this reading was taken.
+ * @param pairKey        Canonical sorted key e.g. "AABBCCDD::EEFF0011"
+ * @param reporterId     Device ID of the phone that made this measurement.
+ * @param peerId         Device ID of the peer that was detected.
+ * @param distanceMeters Estimated distance in metres (RSSI via FSPL formula).
+ * @param rawRssi        Raw RSSI from BLE scan result.
+ * @param smoothedRssi   Kalman-filtered RSSI.
+ * @param confidence     0.0-1.0 signal stability score.
+ * @param timestamp      Unix millis when this reading was taken.
  */
 data class Measurement(
     val pairKey: String,
@@ -28,43 +25,17 @@ data class Measurement(
     val timestamp: Long = System.currentTimeMillis()
 ) {
     /**
-     * Converts this measurement into a Friend object so the existing
-     * ClusteringLogic and RadarNode system can consume it without changes.
-     *
-     * Note: angleDegrees is derived from the peer ID hash — a stable
-     * placeholder until UWB Angle-of-Arrival hardware is available.
-     */
-    fun toFriend(): Friend = Friend(
-        id = peerId,
-        name = "User $peerId",
-        distanceMeters = distanceMeters,
-        angleDegrees = (peerId.hashCode() % 360).toFloat()
-    )
-
-    /**
      * Serialises to a plain Map for Firestore.
-     * We avoid @DocumentId or FirestoreData annotations to keep the
-     * model layer free of Firebase imports — only the repository touches Firebase.
+     * Model layer stays free of Firebase imports.
      */
     fun toFirestoreReporterMap(): Map<String, Any> = mapOf(
-        "distance"    to distanceMeters,
-        "rawRssi"     to rawRssi,
-        "confidence"  to confidence,
-        "ts"          to timestamp
+        "distance"   to distanceMeters,
+        "rawRssi"    to rawRssi,
+        "confidence" to confidence,
+        "ts"         to timestamp
     )
-}
 
-/**
- * Lightweight friend representation used by the radar / clustering layer.
- * Kept separate from Measurement so the UI layer has no dependency on
- * BLE or Firebase concepts.
- */
-data class Friend(
-    val id: String,
-    val name: String,
-    val distanceMeters: Float,
-    val angleDegrees: Float
-) {
-    val x: Float get() = distanceMeters * Math.cos(Math.toRadians(angleDegrees.toDouble())).toFloat()
-    val y: Float get() = distanceMeters * Math.sin(Math.toRadians(angleDegrees.toDouble())).toFloat()
+    /** Human-readable summary for dev logs. */
+    fun toLogString(): String =
+        "pair=$pairKey reporter=$reporterId peer=$peerId dist=${String.format("%.2f", distanceMeters)}m rssi=$rawRssi smooth=${String.format("%.1f", smoothedRssi)} conf=${String.format("%.2f", confidence)}"
 }
