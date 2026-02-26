@@ -36,7 +36,7 @@ class RadarViewModel(application: Application) : AndroidViewModel(application) {
     val myDeviceId: String = DeviceIdentity.getOrCreate(application)
 
     // ── Hardware ───────────────────────────────────────────────────────────────
-    private val bleManager         = BleManager(application, myDeviceId)
+    private val bleManager         = BleManager(application, myDeviceId, viewModelScope)
     private val orientationManager = OrientationManager(application)
 
     // ── Data layer ─────────────────────────────────────────────────────────────

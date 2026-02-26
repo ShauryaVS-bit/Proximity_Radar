@@ -13,7 +13,11 @@ import com.findfriends.core.models.Measurement
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.util.UUID
 
 /**
@@ -28,13 +32,19 @@ import java.util.UUID
 @SuppressLint("MissingPermission")
 class BleManager(
     context: Context,
-    private val myDeviceId: String
+    private val myDeviceId: String,
+    private val scope: CoroutineScope
 ) {
     companion object {
         val APP_UUID: ParcelUuid = ParcelUuid(
             UUID.fromString("0000FEAA-0000-1000-8000-00805F9B34FB")
         )
         private const val PEER_TIMEOUT_MS = 10_000L
+
+        /** Scan runs for this long before pausing to let advertising through. */
+        private const val SCAN_DUTY_ON_MS = 4_000L
+        /** Duration of each scan-pause window where ads can flush out. */
+        private const val ADV_WINDOW_MS   =   200L
     }
 
     // ── Bluetooth system services ──────────────────────────────────────────────
@@ -72,6 +82,8 @@ class BleManager(
     // Hardware-level filters on Samsung/Xiaomi/Pixel can silently drop matching packets,
     // causing the asymmetry bug where one phone sees the other but not vice versa.
     private val scanFilter = emptyList<ScanFilter>()
+
+    private var dutyCycleJob: Job? = null
 
     private fun buildScanSettings(mode: Int) =
         ScanSettings.Builder().setScanMode(mode).build()
@@ -156,7 +168,7 @@ class BleManager(
         try { adv.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(false)
             .setTimeout(0)
             .build()
@@ -171,12 +183,20 @@ class BleManager(
         android.util.Log.d("BleManager", "Advertising started — id=$myDeviceId")
     }
 
+    // ── Low-level scanner control (no status update, no duty-cycle) ────────
+
+    private fun startScannerHw() {
+        val s = scanner ?: return
+        try { s.stopScan(scanCallback) } catch (_: Exception) {}
+        s.startScan(scanFilter, buildScanSettings(currentScanMode), scanCallback)
+    }
+
+    private fun stopScannerHw() {
+        try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
+    }
+
     fun startScanning() {
-        val s = adapter?.bluetoothLeScanner
-        if (s == null) {
-            // This is the key symptom of the asymmetry bug:
-            // permissions weren't granted yet when this was first called,
-            // or Bluetooth is disabled. The HUD will show "SCANNER NULL".
+        if (scanner == null) {
             _status.value = _status.value.copy(
                 isScanning = false,
                 scanMode   = "SCANNER NULL"
@@ -189,22 +209,31 @@ class BleManager(
             return
         }
 
-        // Defensive: stop any previous scan to avoid SCAN_FAILED_ALREADY_STARTED.
-        // On certain Samsung/Xiaomi devices, calling startScan while a scan with
-        // the same callback is already active silently kills the existing scan AND
-        // returns an error code, leaving the device with no active scan at all.
-        try { s.stopScan(scanCallback) } catch (_: Exception) {}
-
-        s.startScan(scanFilter, buildScanSettings(currentScanMode), scanCallback)
+        startScannerHw()
         _status.value = _status.value.copy(
             isScanning = true,
             scanMode   = scanModeLabel(currentScanMode)
         )
         android.util.Log.d("BleManager", "Scanning started — mode=${scanModeLabel(currentScanMode)}")
+
+        // Duty cycle: periodically pause scanning so the shared BLE radio can
+        // transmit queued advertisement packets.  Without this, LOW_LATENCY
+        // scanning monopolises the radio and other devices never see our ads.
+        dutyCycleJob?.cancel()
+        dutyCycleJob = scope.launch {
+            while (true) {
+                delay(SCAN_DUTY_ON_MS)
+                stopScannerHw()
+                delay(ADV_WINDOW_MS)
+                startScannerHw()
+            }
+        }
     }
 
     fun stopScanning() {
-        adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        dutyCycleJob?.cancel()
+        dutyCycleJob = null
+        stopScannerHw()
         _status.value = _status.value.copy(isScanning = false)
         android.util.Log.d("BleManager", "Scanning stopped")
     }
