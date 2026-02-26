@@ -152,6 +152,9 @@ class BleManager(
             return
         }
 
+        // Defensive: stop any previous advertisement to avoid ALREADY_STARTED failure.
+        try { adv.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
+
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
             .setConnectable(false)
@@ -185,6 +188,13 @@ class BleManager(
             )
             return
         }
+
+        // Defensive: stop any previous scan to avoid SCAN_FAILED_ALREADY_STARTED.
+        // On certain Samsung/Xiaomi devices, calling startScan while a scan with
+        // the same callback is already active silently kills the existing scan AND
+        // returns an error code, leaving the device with no active scan at all.
+        try { s.stopScan(scanCallback) } catch (_: Exception) {}
+
         s.startScan(scanFilter, buildScanSettings(currentScanMode), scanCallback)
         _status.value = _status.value.copy(
             isScanning = true,
@@ -220,7 +230,16 @@ class BleManager(
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) {
+            val reason = when (errorCode) {
+                ADVERTISE_FAILED_DATA_TOO_LARGE       -> "DATA_TOO_LARGE"
+                ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "TOO_MANY_ADVERTISERS"
+                ADVERTISE_FAILED_ALREADY_STARTED      -> "ALREADY_STARTED"
+                ADVERTISE_FAILED_INTERNAL_ERROR       -> "INTERNAL_ERROR"
+                ADVERTISE_FAILED_FEATURE_UNSUPPORTED  -> "FEATURE_UNSUPPORTED"
+                else                                  -> "UNKNOWN($errorCode)"
+            }
             _status.value = _status.value.copy(isAdvertising = false)
+            android.util.Log.e("BleManager", "onAdvertiseStartFailure: $reason (code=$errorCode)")
         }
     }
 
