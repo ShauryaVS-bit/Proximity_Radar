@@ -4,125 +4,190 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.ParcelUuid
 import com.findfriends.core.algorithms.BleMath
 import com.findfriends.core.algorithms.KalmanFilter
 import com.findfriends.core.algorithms.PairUtils
 import com.findfriends.core.models.Measurement
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import com.findfriends.logging.DevLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 
 /**
- * Manages BLE advertising and scanning.
+ * Core BLE engine: scan for peers + advertise this device's identity.
  *
- * Each discovered peer gets its own [KalmanFilter] for RSSI smoothing.
- * Peers not seen for [PEER_TIMEOUT_MS] are pruned from the measurements list.
+ * Every operation is wrapped with:
+ *   - Null checks (adapter/scanner/advertiser)
+ *   - Exception guards
+ *   - DevLog entries so you can trace every state change in the UI
  *
- * Now also exposes [BleStatus] — a small state object the HUD reads to show
- * whether scanning/advertising is active and which scan mode is in use.
+ * Duty-cycle scanning: 4s scan / 200ms pause so the shared radio can
+ * flush advertisement packets. Without this, LOW_LATENCY scanning
+ * monopolises the antenna and other devices never see our ads.
  */
 @SuppressLint("MissingPermission")
 class BleManager(
-    context: Context,
+    private val context: Context,
     private val myDeviceId: String,
     private val scope: CoroutineScope
 ) {
     companion object {
+        private const val TAG = "BLE"
+
         val APP_UUID: ParcelUuid = ParcelUuid(
             UUID.fromString("0000FEAA-0000-1000-8000-00805F9B34FB")
         )
-        private const val PEER_TIMEOUT_MS = 10_000L
 
-        /** Scan runs for this long before pausing to let advertising through. */
-        private const val SCAN_DUTY_ON_MS = 4_000L
-        /** Duration of each scan-pause window where ads can flush out. */
-        private const val ADV_WINDOW_MS   =   200L
+        private const val PEER_TIMEOUT_MS   = 10_000L
+        private const val SCAN_DUTY_ON_MS   = 4_000L
+        private const val ADV_WINDOW_MS     = 200L
+        private const val SCAN_RETRY_DELAY  = 2_000L
+        private const val MAX_SCAN_RETRIES  = 3
     }
 
-    // ── Bluetooth system services ──────────────────────────────────────────────
-    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val adapter: BluetoothAdapter? = bluetoothManager.adapter
+    // -- Bluetooth system services ------------------------------------------------
 
-    // Computed properties instead of vals — re-fetched on every call so they
-    // are never null-cached at construction time before permissions are granted.
-    // This is the root fix for the "Phone B scanner is null" asymmetry bug.
+    private val bluetoothManager: BluetoothManager? =
+        context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+
+    private val adapter: BluetoothAdapter? = bluetoothManager?.adapter
+
+    // Re-fetched every call so they're never null-cached before permissions grant
     private val scanner: BluetoothLeScanner?
         get() = adapter?.bluetoothLeScanner
     private val advertiser: BluetoothLeAdvertiser?
         get() = adapter?.bluetoothLeAdvertiser
 
-    // ── Per-peer state ─────────────────────────────────────────────────────────
+    // -- Per-peer state -----------------------------------------------------------
+
     private val kalmanFilters = mutableMapOf<String, KalmanFilter>()
     private val lastSeenMap   = mutableMapOf<String, Long>()
 
-    // ── Public: live measurements ──────────────────────────────────────────────
+    // -- Public: live measurements ------------------------------------------------
+
     private val _measurements = MutableStateFlow<List<Measurement>>(emptyList())
     val measurements: StateFlow<List<Measurement>> = _measurements.asStateFlow()
 
-    // ── Public: BLE status for HUD ─────────────────────────────────────────────
-    private val _status = MutableStateFlow(BleStatus())
+    // -- Public: BLE operational status -------------------------------------------
 
-    /**
-     * Live BLE operational status. Collect in ViewModel, forward to HudState.
-     */
+    private val _status = MutableStateFlow(BleStatus())
     val status: StateFlow<BleStatus> = _status.asStateFlow()
 
-    // ── Scan config ────────────────────────────────────────────────────────────
+    // -- Scan config --------------------------------------------------------------
+
     private var currentScanMode = ScanSettings.SCAN_MODE_LOW_LATENCY
-
-    // Empty filter = scan ALL nearby BLE devices, then filter manually in the callback.
-    // Hardware-level filters on Samsung/Xiaomi/Pixel can silently drop matching packets,
-    // causing the asymmetry bug where one phone sees the other but not vice versa.
     private val scanFilter = emptyList<ScanFilter>()
-
     private var dutyCycleJob: Job? = null
+    private var peerPruneJob: Job? = null
+    private var scanRetryCount = 0
 
-    private fun buildScanSettings(mode: Int) =
-        ScanSettings.Builder().setScanMode(mode).build()
+    // -- Bluetooth state receiver -------------------------------------------------
 
-    // ── Scan callback ──────────────────────────────────────────────────────────
+    private var btStateReceiver: BroadcastReceiver? = null
+    private var isReceiverRegistered = false
+
+    init {
+        DevLog.i(TAG, "BleManager init | deviceId=$myDeviceId")
+        DevLog.d(TAG, "Adapter present: ${adapter != null}")
+        DevLog.d(TAG, "BLE supported: ${adapter?.isEnabled}")
+
+        if (adapter == null) {
+            DevLog.e(TAG, "BluetoothAdapter is NULL - device may not support BLE")
+        }
+
+        registerBluetoothStateReceiver()
+    }
+
+    /**
+     * Monitor Bluetooth on/off. If BT is turned off mid-session, stop
+     * everything gracefully. If turned back on, log it (user must restart).
+     */
+    private fun registerBluetoothStateReceiver() {
+        btStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                when (state) {
+                    BluetoothAdapter.STATE_OFF -> {
+                        DevLog.w(TAG, "Bluetooth turned OFF - stopping scan & advertise")
+                        stopScanningInternal()
+                        stopAdvertisingInternal()
+                        _status.value = BleStatus() // reset
+                    }
+                    BluetoothAdapter.STATE_ON -> {
+                        DevLog.i(TAG, "Bluetooth turned ON - ready for scan/advertise")
+                    }
+                    BluetoothAdapter.STATE_TURNING_OFF -> {
+                        DevLog.w(TAG, "Bluetooth turning off...")
+                    }
+                    BluetoothAdapter.STATE_TURNING_ON -> {
+                        DevLog.d(TAG, "Bluetooth turning on...")
+                    }
+                }
+            }
+        }
+        try {
+            context.registerReceiver(
+                btStateReceiver,
+                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            )
+            isReceiverRegistered = true
+            DevLog.d(TAG, "Bluetooth state receiver registered")
+        } catch (e: Exception) {
+            DevLog.e(TAG, "Failed to register BT state receiver: ${e.message}")
+        }
+    }
+
+    // -- Scan callback ------------------------------------------------------------
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            // Manual UUID filter — replaces the removed hardware ScanFilter.
-            // We now manually check for our service UUID so we still ignore
-            // irrelevant BLE devices, but without relying on the hardware filter
-            // that silently fails on certain Android manufacturers.
             val serviceData = result.scanRecord?.getServiceData(APP_UUID) ?: return
             val peerId = String(serviceData).trim()
             if (peerId == myDeviceId || peerId.isBlank()) return
 
-            lastSeenMap[peerId] = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
+            val isNewPeer = !lastSeenMap.containsKey(peerId)
+            lastSeenMap[peerId] = now
 
-            val filter        = kalmanFilters.getOrPut(peerId) { KalmanFilter() }
-            val smoothedRssi  = filter.update(result.rssi.toDouble())
-            val distance      = BleMath.calculateDistance(smoothedRssi.toInt())
-            val confidence    = BleMath.confidenceScore(result.rssi, smoothedRssi)
+            val filter       = kalmanFilters.getOrPut(peerId) { KalmanFilter() }
+            val smoothedRssi = filter.update(result.rssi.toDouble())
+            val distance     = BleMath.calculateDistance(smoothedRssi.toInt())
+            val confidence   = BleMath.confidenceScore(result.rssi, smoothedRssi)
+            val pairKey      = PairUtils.canonicalKey(myDeviceId, peerId)
 
-            updateMeasurement(
-                Measurement(
-                    pairKey        = PairUtils.canonicalKey(myDeviceId, peerId),
-                    reporterId     = myDeviceId,
-                    peerId         = peerId,
-                    distanceMeters = distance,
-                    rawRssi        = result.rssi,
-                    smoothedRssi   = smoothedRssi,
-                    confidence     = confidence,
-                    timestamp      = System.currentTimeMillis()
-                )
+            if (isNewPeer) {
+                DevLog.i(TAG, "NEW PEER discovered: $peerId | rssi=${result.rssi} | dist=${String.format("%.2f", distance)}m")
+            }
+
+            DevLog.d(TAG, "SCAN | peer=$peerId rssi=${result.rssi} smoothed=${String.format("%.1f", smoothedRssi)} dist=${String.format("%.2f", distance)}m conf=${String.format("%.2f", confidence)} pair=$pairKey")
+
+            val measurement = Measurement(
+                pairKey        = pairKey,
+                reporterId     = myDeviceId,
+                peerId         = peerId,
+                distanceMeters = distance,
+                rawRssi        = result.rssi,
+                smoothedRssi   = smoothedRssi,
+                confidence     = confidence,
+                timestamp      = now
             )
+
+            updateMeasurement(measurement)
         }
 
         override fun onScanFailed(errorCode: Int) {
-            // Decode the error so it shows up clearly in the HUD and logcat.
-            // Previously this was silent — making debugging impossible.
             val reason = when (errorCode) {
                 SCAN_FAILED_ALREADY_STARTED                 -> "ALREADY_STARTED"
                 SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "REGISTRATION_FAILED"
@@ -130,41 +195,128 @@ class BleManager(
                 SCAN_FAILED_INTERNAL_ERROR                  -> "INTERNAL_ERROR"
                 else                                        -> "UNKNOWN($errorCode)"
             }
-            _status.value = _status.value.copy(
-                isScanning = false,
-                scanMode   = "FAILED:$reason"
-            )
-            android.util.Log.e("BleManager", "onScanFailed: $reason (code=$errorCode)")
+            DevLog.e(TAG, "Scan FAILED: $reason (code=$errorCode)")
+            _status.value = _status.value.copy(isScanning = false, scanMode = "FAILED:$reason")
+
+            // Auto-retry for transient errors
+            if (errorCode == SCAN_FAILED_INTERNAL_ERROR && scanRetryCount < MAX_SCAN_RETRIES) {
+                scanRetryCount++
+                DevLog.w(TAG, "Scheduling scan retry $scanRetryCount/$MAX_SCAN_RETRIES in ${SCAN_RETRY_DELAY}ms")
+                scope.launch {
+                    delay(SCAN_RETRY_DELAY * scanRetryCount)
+                    DevLog.i(TAG, "Retrying scan (attempt $scanRetryCount)")
+                    startScannerHw()
+                }
+            }
         }
     }
 
-    // ── State helpers ──────────────────────────────────────────────────────────
+    // -- State helpers ------------------------------------------------------------
+
     private fun updateMeasurement(new: Measurement) {
         _measurements.update { current ->
             val mutable = current.toMutableList()
             val idx = mutable.indexOfFirst { it.pairKey == new.pairKey }
             if (idx >= 0) mutable[idx] = new else mutable.add(new)
             val now = System.currentTimeMillis()
-            mutable.filter { m -> (now - (lastSeenMap[m.peerId] ?: 0L)) < PEER_TIMEOUT_MS }
+            val before = mutable.size
+            val filtered = mutable.filter { m -> (now - (lastSeenMap[m.peerId] ?: 0L)) < PEER_TIMEOUT_MS }
+            val pruned = before - filtered.size
+            if (pruned > 0) {
+                DevLog.w(TAG, "Pruned $pruned stale peer(s) (timeout=${PEER_TIMEOUT_MS}ms)")
+            }
+            filtered
         }
     }
 
-    // ── Public API ─────────────────────────────────────────────────────────────
+    /** Periodic job to prune stale peers even when no new scans arrive. */
+    private fun startPeerPruneLoop() {
+        peerPruneJob?.cancel()
+        peerPruneJob = scope.launch {
+            while (true) {
+                delay(PEER_TIMEOUT_MS / 2)
+                val now = System.currentTimeMillis()
+                val stale = lastSeenMap.filter { (_, ts) -> now - ts >= PEER_TIMEOUT_MS }
+                if (stale.isNotEmpty()) {
+                    stale.keys.forEach { peerId ->
+                        lastSeenMap.remove(peerId)
+                        kalmanFilters.remove(peerId)
+                        DevLog.w(TAG, "Peer TIMED OUT: $peerId (not seen for ${PEER_TIMEOUT_MS}ms)")
+                    }
+                    _measurements.update { current ->
+                        current.filter { m -> !stale.containsKey(m.peerId) }
+                    }
+                }
+            }
+        }
+    }
 
+    // -- Low-level scanner control ------------------------------------------------
+
+    private fun startScannerHw() {
+        val s = scanner
+        if (s == null) {
+            DevLog.e(TAG, "startScannerHw: scanner is NULL (BT off or no permission)")
+            return
+        }
+        try {
+            s.stopScan(scanCallback)
+        } catch (_: Exception) {}
+        try {
+            s.startScan(scanFilter, buildScanSettings(currentScanMode), scanCallback)
+        } catch (e: Exception) {
+            DevLog.e(TAG, "startScannerHw exception: ${e.message}")
+        }
+    }
+
+    private fun stopScannerHw() {
+        try {
+            scanner?.stopScan(scanCallback)
+        } catch (e: Exception) {
+            DevLog.w(TAG, "stopScannerHw exception: ${e.message}")
+        }
+    }
+
+    private fun buildScanSettings(mode: Int) =
+        ScanSettings.Builder().setScanMode(mode).build()
+
+    // -- Public API ---------------------------------------------------------------
+
+    /**
+     * Check if Bluetooth is enabled and ready.
+     */
+    fun isBluetoothReady(): Boolean {
+        val ready = adapter?.isEnabled == true
+        DevLog.d(TAG, "isBluetoothReady: $ready")
+        return ready
+    }
+
+    /**
+     * Start advertising this device's ID over BLE.
+     */
     fun startAdvertising() {
-        val adv = adapter?.bluetoothLeAdvertiser
-        if (adv == null) {
+        DevLog.i(TAG, "startAdvertising() called")
+
+        if (adapter == null) {
+            DevLog.e(TAG, "Cannot advertise: BluetoothAdapter is NULL")
             _status.value = _status.value.copy(isAdvertising = false)
-            android.util.Log.e(
-                "BleManager",
-                "startAdvertising: bluetoothLeAdvertiser is null — " +
-                        "BLUETOOTH_ADVERTISE permission missing, Bluetooth off, " +
-                        "or device does not support BLE advertising."
-            )
             return
         }
 
-        // Defensive: stop any previous advertisement to avoid ALREADY_STARTED failure.
+        if (adapter.isEnabled != true) {
+            DevLog.e(TAG, "Cannot advertise: Bluetooth is OFF")
+            _status.value = _status.value.copy(isAdvertising = false)
+            return
+        }
+
+        val adv = advertiser
+        if (adv == null) {
+            DevLog.e(TAG, "Cannot advertise: BluetoothLeAdvertiser is NULL (device may not support BLE peripheral mode)")
+            _status.value = _status.value.copy(isAdvertising = false)
+            return
+        }
+
+        // Stop any previous advertisement to avoid ALREADY_STARTED
         try { adv.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
 
         val settings = AdvertiseSettings.Builder()
@@ -178,86 +330,139 @@ class BleManager(
             .addServiceData(APP_UUID, myDeviceId.toByteArray())
             .build()
 
-        adv.startAdvertising(settings, data, advertiseCallback)
-        _status.value = _status.value.copy(isAdvertising = true)
-        android.util.Log.d("BleManager", "Advertising started — id=$myDeviceId")
+        try {
+            adv.startAdvertising(settings, data, advertiseCallback)
+            _status.value = _status.value.copy(isAdvertising = true)
+            DevLog.i(TAG, "Advertising STARTED | id=$myDeviceId | uuid=${APP_UUID.uuid} | mode=LOW_LATENCY | connectable=false")
+        } catch (e: Exception) {
+            DevLog.e(TAG, "startAdvertising exception: ${e.message}")
+            _status.value = _status.value.copy(isAdvertising = false)
+        }
     }
 
-    // ── Low-level scanner control (no status update, no duty-cycle) ────────
-
-    private fun startScannerHw() {
-        val s = scanner ?: return
-        try { s.stopScan(scanCallback) } catch (_: Exception) {}
-        s.startScan(scanFilter, buildScanSettings(currentScanMode), scanCallback)
-    }
-
-    private fun stopScannerHw() {
-        try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
-    }
-
+    /**
+     * Start scanning for nearby BLE peers with duty-cycle.
+     */
     fun startScanning() {
-        if (scanner == null) {
-            _status.value = _status.value.copy(
-                isScanning = false,
-                scanMode   = "SCANNER NULL"
-            )
-            android.util.Log.e(
-                "BleManager",
-                "startScanning: bluetoothLeScanner is null — " +
-                        "BLUETOOTH_SCAN permission missing or Bluetooth is off."
-            )
+        DevLog.i(TAG, "startScanning() called | mode=${scanModeLabel(currentScanMode)}")
+
+        if (adapter == null) {
+            DevLog.e(TAG, "Cannot scan: BluetoothAdapter is NULL")
+            _status.value = _status.value.copy(isScanning = false, scanMode = "NO ADAPTER")
             return
         }
 
+        if (adapter.isEnabled != true) {
+            DevLog.e(TAG, "Cannot scan: Bluetooth is OFF")
+            _status.value = _status.value.copy(isScanning = false, scanMode = "BT OFF")
+            return
+        }
+
+        if (scanner == null) {
+            DevLog.e(TAG, "Cannot scan: BluetoothLeScanner is NULL (permission missing or BT off)")
+            _status.value = _status.value.copy(isScanning = false, scanMode = "SCANNER NULL")
+            return
+        }
+
+        scanRetryCount = 0
         startScannerHw()
         _status.value = _status.value.copy(
             isScanning = true,
             scanMode   = scanModeLabel(currentScanMode)
         )
-        android.util.Log.d("BleManager", "Scanning started — mode=${scanModeLabel(currentScanMode)}")
+        DevLog.i(TAG, "Scanning STARTED | mode=${scanModeLabel(currentScanMode)} | dutyOn=${SCAN_DUTY_ON_MS}ms | advWindow=${ADV_WINDOW_MS}ms")
 
-        // Duty cycle: periodically pause scanning so the shared BLE radio can
-        // transmit queued advertisement packets.  Without this, LOW_LATENCY
-        // scanning monopolises the radio and other devices never see our ads.
+        // Duty cycle loop
         dutyCycleJob?.cancel()
         dutyCycleJob = scope.launch {
             while (true) {
                 delay(SCAN_DUTY_ON_MS)
+                DevLog.d(TAG, "Duty cycle: pausing scan for ${ADV_WINDOW_MS}ms (adv window)")
                 stopScannerHw()
                 delay(ADV_WINDOW_MS)
+                DevLog.d(TAG, "Duty cycle: resuming scan")
                 startScannerHw()
+            }
+        }
+
+        // Peer prune loop
+        startPeerPruneLoop()
+    }
+
+    fun stopScanning() {
+        DevLog.i(TAG, "stopScanning() called")
+        stopScanningInternal()
+    }
+
+    private fun stopScanningInternal() {
+        dutyCycleJob?.cancel()
+        dutyCycleJob = null
+        peerPruneJob?.cancel()
+        peerPruneJob = null
+        stopScannerHw()
+        _status.value = _status.value.copy(isScanning = false)
+        DevLog.i(TAG, "Scanning STOPPED")
+    }
+
+    fun stopAdvertising() {
+        DevLog.i(TAG, "stopAdvertising() called")
+        stopAdvertisingInternal()
+    }
+
+    private fun stopAdvertisingInternal() {
+        try {
+            advertiser?.stopAdvertising(advertiseCallback)
+        } catch (e: Exception) {
+            DevLog.w(TAG, "stopAdvertising exception: ${e.message}")
+        }
+        _status.value = _status.value.copy(isAdvertising = false)
+        DevLog.i(TAG, "Advertising STOPPED")
+    }
+
+    /**
+     * Switch scan mode. Restarts scan with new setting.
+     */
+    fun setScanMode(mode: Int) {
+        val label = scanModeLabel(mode)
+        DevLog.i(TAG, "setScanMode: $label")
+        currentScanMode = mode
+        if (_status.value.isScanning) {
+            stopScanningInternal()
+            startScanning()
+        }
+    }
+
+    /** Expose last-seen timestamps for status display. */
+    fun lastSeenTimestamps(): Map<String, Long> = lastSeenMap.toMap()
+
+    /** Total unique peers ever seen this session. */
+    fun totalPeersEverSeen(): Int = kalmanFilters.size
+
+    /** Clean up resources. */
+    fun destroy() {
+        DevLog.i(TAG, "destroy() - cleaning up BleManager")
+        stopScanningInternal()
+        stopAdvertisingInternal()
+        kalmanFilters.clear()
+        lastSeenMap.clear()
+        if (isReceiverRegistered) {
+            try {
+                context.unregisterReceiver(btStateReceiver)
+                isReceiverRegistered = false
+                DevLog.d(TAG, "BT state receiver unregistered")
+            } catch (e: Exception) {
+                DevLog.w(TAG, "Failed to unregister BT receiver: ${e.message}")
             }
         }
     }
 
-    fun stopScanning() {
-        dutyCycleJob?.cancel()
-        dutyCycleJob = null
-        stopScannerHw()
-        _status.value = _status.value.copy(isScanning = false)
-        android.util.Log.d("BleManager", "Scanning stopped")
-    }
-
-    fun stopAdvertising() {
-        adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
-        _status.value = _status.value.copy(isAdvertising = false)
-        android.util.Log.d("BleManager", "Advertising stopped")
-    }
-
-    /**
-     * Switch scan mode (LOW_LATENCY foreground / LOW_POWER background).
-     * Restarts the scan automatically with the new setting.
-     */
-    fun setScanMode(mode: Int) {
-        currentScanMode = mode
-        stopScanning()
-        startScanning()
-    }
-
-    /** Exposes the last-seen timestamps map so the HUD can calculate peer age. */
-    fun lastSeenTimestamps(): Map<String, Long> = lastSeenMap.toMap()
+    // -- Advertise callback -------------------------------------------------------
 
     private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            DevLog.i(TAG, "Advertise onStartSuccess | txPowerLevel=${settingsInEffect.txPowerLevel} | mode=${settingsInEffect.mode} | timeout=${settingsInEffect.timeout}")
+        }
+
         override fun onStartFailure(errorCode: Int) {
             val reason = when (errorCode) {
                 ADVERTISE_FAILED_DATA_TOO_LARGE       -> "DATA_TOO_LARGE"
@@ -267,8 +472,8 @@ class BleManager(
                 ADVERTISE_FAILED_FEATURE_UNSUPPORTED  -> "FEATURE_UNSUPPORTED"
                 else                                  -> "UNKNOWN($errorCode)"
             }
+            DevLog.e(TAG, "Advertise FAILED: $reason (code=$errorCode)")
             _status.value = _status.value.copy(isAdvertising = false)
-            android.util.Log.e("BleManager", "onAdvertiseStartFailure: $reason (code=$errorCode)")
         }
     }
 
@@ -276,15 +481,15 @@ class BleManager(
         ScanSettings.SCAN_MODE_LOW_LATENCY -> "LOW_LATENCY"
         ScanSettings.SCAN_MODE_LOW_POWER   -> "LOW_POWER"
         ScanSettings.SCAN_MODE_BALANCED    -> "BALANCED"
-        else                               -> "UNKNOWN"
+        else                               -> "UNKNOWN($mode)"
     }
 }
 
 /**
- * Snapshot of current BLE operational state for the HUD.
+ * Snapshot of current BLE operational state.
  */
 data class BleStatus(
     val isScanning: Boolean    = false,
     val isAdvertising: Boolean = false,
-    val scanMode: String       = "—"
+    val scanMode: String       = "-"
 )
